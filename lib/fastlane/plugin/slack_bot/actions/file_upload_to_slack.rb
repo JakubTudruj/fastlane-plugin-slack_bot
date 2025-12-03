@@ -26,28 +26,68 @@ module Fastlane
         begin
           require 'faraday'
 
-          api_url = "https://slack.com/api/files.upload"
-          conn = Faraday.new(url: api_url) do |faraday|
+          upload_filename = self.determine_upload_filename(params, file_path)
+
+          get_url_api = "https://slack.com/api/files.getUploadURLExternal"
+          conn_get = Faraday.new(url: get_url_api) do |faraday|
+            faraday.request :url_encoded
+            faraday.adapter :net_http
+          end
+
+          response_get = conn_get.post do |req|
+            req.headers['Authorization'] = "Bearer #{params[:api_token]}"
+            req.body = {
+              filename: upload_filename,
+              length: File.size(file_path)
+            }
+          end
+
+          json_get = self.parse_json(response_get.body) || {}
+          unless json_get['ok'] && json_get['upload_url'] && json_get['file_id']
+            UI.error("Failed to get upload URL from Slack: #{json_get.inspect}")
+            return nil
+          end
+
+          upload_url = json_get['upload_url']
+          file_id = json_get['file_id']
+
+          upload_conn = Faraday.new do |faraday|
             faraday.request :multipart
             faraday.request :url_encoded
             faraday.adapter :net_http
           end
 
-          payload = {
-            channels: params[:channels],
-            file: Faraday::FilePart.new(file_path, file_type),
-            filename: file_name,
-            filetype: file_type
+          upload_response = upload_conn.post(upload_url) do |req|
+            req.headers['Content-Type'] = 'application/octet-stream'
+            req.body = File.open(file_path, 'rb') { |f| f.read }
+          end
+
+          unless upload_response.status == 200
+            UI.error("File upload to Slack upload_url failed with status #{upload_response.status}")
+            return nil
+          end
+
+          complete_api = "https://slack.com/api/files.completeUploadExternal"
+          conn_complete = Faraday.new(url: complete_api) do |faraday|
+            faraday.request :url_encoded
+            faraday.adapter :net_http
+          end
+
+          files_param = [{ id: file_id }]
+          files_param[0][:title] = params[:title] unless params[:title].nil?
+
+          payload_complete = {
+            files: files_param.to_json
           }
 
-          payload[:title] = params[:title] unless params[:title].nil?
-          payload[:initial_comment] = params[:initial_comment] unless params[:initial_comment].nil?
-          payload[:thread_ts] = params[:thread_ts] unless params[:thread_ts].nil?
+          payload_complete[:channels] = params[:channels] unless params[:channels].nil?
+          payload_complete[:initial_comment] = params[:initial_comment] unless params[:initial_comment].nil?
+          payload_complete[:thread_ts] = params[:thread_ts] unless params[:thread_ts].nil?
 
-          response = conn.post do |req|
+          response = conn_complete.post do |req|
             req.headers['Authorization'] = "Bearer #{params[:api_token]}"
-            req.body = payload
-           end
+            req.body = payload_complete
+          end
 
           result = self.formatted_result(response)
         rescue => exception
@@ -66,6 +106,18 @@ module Fastlane
           body: response.body || "",
           json: self.parse_json(response.body) || {}
         }
+      end
+
+      def self.determine_upload_filename(params, file_path)
+        if params[:file_name].to_s.empty?
+          File.basename(file_path)
+        else
+          if File.extname(params[:file_name]).to_s.empty?
+            params[:file_name].to_s + File.extname(file_path)
+          else
+            params[:file_name].to_s
+          end
+        end
       end
 
       def self.parse_json(value)
